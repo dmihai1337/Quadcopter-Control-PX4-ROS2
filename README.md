@@ -12,6 +12,8 @@ The next step is setting up `PX4 Autopilot`, which is done by cloning the repo a
 
 In order to facilitate communication between PX4 Autopilot and ROS2 we need to set up a piece of middleware called `uXRCE-DDS` as detailed in the [PX4 documentation for ROS2](https://docs.px4.io/main/en/ros2/user_guide.html#setup-micro-xrce-dds-agent-client), which allows the uORB messages of PX4 to be published and subscribed to as though they were ROS topics. An issue was encountered here while building from source, where, in the CMakeLists.txt a branch is specified that does not exist anymore. Referencing a newer, existing branch instead, fixed the problem.
 
+In every ROS2 x PX4 workspace there needs to be a copy of the package [`px4_msgs`](https://github.com/PX4/px4_msgs), which contains ROS2 message definitions for PX4. The package [`px4_ros_com`](https://github.com/PX4/px4_ros_com) contains example nodes for exchanging data and commands between ROS2 and PX4, so we'll clone it as well to get some boilerplate from it.
+
 The last tool that we need for now is the Ground Control Station [`QGroundControl`](https://docs.qgroundcontrol.com/master/en/qgc-user-guide/getting_started/download_and_install.html#ubuntu), for communication with the drone.
 
 
