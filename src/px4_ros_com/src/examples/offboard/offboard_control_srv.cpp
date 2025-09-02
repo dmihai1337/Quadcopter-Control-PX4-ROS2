@@ -34,9 +34,7 @@
  * @brief Offboard control example
  * @file offboard_control.cpp
  * @addtogroup examples * 
- * @author Beniamino Pozzan <beniamino.pozzan@gmail.com>
- * @author Mickey Cowden <info@cowden.tech>
- * @author Nuno Marques <nuno.marques@dronesolutions.io>
+ * @author Mihai-Andrei Dancu <dancumihai13@gmail.com>
  */
 
 #include <px4_msgs/msg/offboard_control_mode.hpp>
@@ -63,19 +61,33 @@ public:
 		Node("offboard_control_srv"),
 		state_{State::init},
 		service_result_{0},
+
+		// ========================== SUBSCRIBERS ========================== //
+
+		// vehicle local position so we know when altitude is reached
 		service_done_{false},
 		vehicle_local_position_subscriber_{this->create_subscription<VehicleLocalPosition>(
 			px4_namespace+"out/vehicle_local_position_v1",
 			rclcpp::QoS(1).transient_local().best_effort(),
 			std::bind(&OffboardControl::vehicle_local_position_callback, this, std::placeholders::_1)
 		)},
+
+		// land detection flag to know when vehicle has landed
 		vehicle_land_detected_subscriber_{this->create_subscription<VehicleLandDetected>(
 			px4_namespace+"out/vehicle_land_detected",
 			rclcpp::QoS(1).transient_local().best_effort(),
 			std::bind(&OffboardControl::vehicle_land_detected_callback, this, std::placeholders::_1)
 		)},
+
+		// ========================== PUBLISHERS ========================== //
+
+		// setting the mode of offboard control, namely position
 		offboard_control_mode_publisher_{this->create_publisher<OffboardControlMode>(px4_namespace+"in/offboard_control_mode", 10)},
+
+		// the goal pose topic for navigation
 		trajectory_setpoint_publisher_{this->create_publisher<TrajectorySetpoint>(px4_namespace+"in/trajectory_setpoint", 10)},
+
+		// the general topic to publish the vehicle command on
 		vehicle_command_client_{this->create_client<px4_msgs::srv::VehicleCommand>(px4_namespace+"vehicle_command")}
 	{
 	
@@ -90,6 +102,7 @@ public:
 		}
 
 		timer_ = this->create_wall_timer(100ms, std::bind(&OffboardControl::timer_callback, this));
+
 		point.position = {0.0, 0.0, -5.0};
 	}
 
@@ -99,6 +112,7 @@ public:
 	void land();
 
 private:
+
 	enum class State{
 		init,
 		offboard_requested,
