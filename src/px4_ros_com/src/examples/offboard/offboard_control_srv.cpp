@@ -112,21 +112,22 @@ public:
 	void land();
 
 private:
-
 	enum class State{
 		init,
 		offboard_requested,
 		wait_for_stable_offboard_mode,
 		arm_requested,
 		ascend,
+		point1, point2, point3, point4,
 		land
 	} state_;
 	uint8_t service_result_;
 	bool service_done_;
 	rclcpp::TimerBase::SharedPtr timer_; 
-	float current_altitude;
+	VehicleLocalPosition current_position;
 	bool land_detected;
 	TrajectorySetpoint point{};
+	float eps = 0.035;
 
 	rclcpp::Subscription<VehicleLocalPosition>::SharedPtr vehicle_local_position_subscriber_;
 	rclcpp::Subscription<VehicleLandDetected>::SharedPtr vehicle_land_detected_subscriber_;
@@ -142,6 +143,7 @@ private:
 	void timer_callback(void);
 	void vehicle_local_position_callback(const VehicleLocalPosition & msg);
 	void vehicle_land_detected_callback(const VehicleLandDetected & msg);
+	float dist(std::array<float, 3> point1, std::array<float, 3> point2);
 };
 
 /**
@@ -183,7 +185,7 @@ void OffboardControl::land()
  * @brief Callback for Vehicle Local Position subscriber
  */
 void OffboardControl::vehicle_local_position_callback(const VehicleLocalPosition & msg){
-	this->current_altitude = msg.z;
+	this->current_position = msg;
 }
 
 /**
@@ -191,6 +193,13 @@ void OffboardControl::vehicle_local_position_callback(const VehicleLocalPosition
  */
 void OffboardControl::vehicle_land_detected_callback(const VehicleLandDetected & msg){
 	this->land_detected = msg.landed;
+}
+
+/**
+ * @brief Distance between two points
+ */
+float OffboardControl::dist(std::array<float, 3> point1, std::array<float, 3> point2){
+	return sqrt(point2[0] - point1[0])*(point2[0] - point1[0]) +  (point2[1] - point1[1])*(point2[1] - point1[1]);
 }
 
 /**
@@ -296,7 +305,35 @@ void OffboardControl::timer_callback(void){
 		}
 		break;
 	case State::ascend :
-		if(current_altitude < -5){
+		if(current_position.z < -5){
+			point.position = {10.0, 0.0, -5.0};
+			state_ = State::point1;
+		}
+		break;
+	case State::point1 :
+		if(dist({current_position.x, current_position.y, current_position.z}, point.position) < eps) {
+			point.position = {10.0, 10.0, -5.0};
+			RCLCPP_INFO(this->get_logger(), "Reached point 1");
+			state_ = State::point2;
+		}
+		break;
+	case State::point2 :
+		if(dist({current_position.x, current_position.y, current_position.z}, point.position) < eps) {
+			point.position = {0.0, 10.0, -5.0};
+			RCLCPP_INFO(this->get_logger(), "Reached point 2");
+			state_ = State::point3;
+		}
+		break;
+	case State::point3 :
+		if(dist({current_position.x, current_position.y, current_position.z}, point.position) < eps) {
+			point.position = {0.0, 0.0, -5.0};
+			RCLCPP_INFO(this->get_logger(), "Reached point 3");
+			state_ = State::point4;
+		}
+		break;
+	case State::point4 :
+		if(dist({current_position.x, current_position.y, current_position.z}, point.position) < eps) {
+			RCLCPP_INFO(this->get_logger(), "Reached point 4");
 			land();
 			state_ = State::land;
 		}
