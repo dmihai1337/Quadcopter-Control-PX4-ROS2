@@ -199,7 +199,7 @@ void OffboardControl::vehicle_land_detected_callback(const VehicleLandDetected &
  * @brief Distance between two points
  */
 float OffboardControl::dist(std::array<float, 3> point1, std::array<float, 3> point2){
-	return sqrt(point2[0] - point1[0])*(point2[0] - point1[0]) +  (point2[1] - point1[1])*(point2[1] - point1[1]);
+	return sqrt((point2[0] - point1[0])*(point2[0] - point1[0]) + (point2[1] - point1[1])*(point2[1] - point1[1]));
 }
 
 /**
