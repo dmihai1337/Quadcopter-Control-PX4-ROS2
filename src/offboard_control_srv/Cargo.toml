@@ -1,0 +1,12 @@
+[package]
+name = "offboard_control_srv"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "offboard_control_srv"
+path = "src/offboard_control_srv.rs"
+
+[dependencies]
+rclrs = "*"
+px4_msgs = "*"
