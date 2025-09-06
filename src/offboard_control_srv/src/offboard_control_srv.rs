@@ -15,6 +15,17 @@ use px4_msgs::srv::{
     VehicleCommand_Response
 };
 
+#[derive(Debug, PartialEq)]
+enum State {
+    Init,
+    OffboardRequested,
+    WaitForStableOffboardMode,
+    ArmRequested,
+    Ascend,
+    Point1, Point2, Point3, Point4,
+    Land
+}
+
 pub struct OffboardControlNode {
 
     node: Node,
@@ -25,13 +36,8 @@ pub struct OffboardControlNode {
 
     // ======================================= SUBSCRIBERS  ======================================= //
 
-    #[allow(unused)]
-    vehicle_local_position_subscriber: WorkerSubscription<VehicleLocalPosition, Option<VehicleLocalPosition>>,
-    vehicle_local_position_worker: Worker<Option<VehicleLocalPosition>>,
-
-    #[allow(unused)]
-    vehicle_land_detected_subscriber: WorkerSubscription<VehicleLandDetected, Option<bool>>,
-    vehicle_land_detected_worker: Worker<Option<bool>>,
+    vehicle_local_position_subscriber: Subscription<VehicleLocalPosition>,
+    vehicle_land_detected_subscriber: Subscription<VehicleLandDetected>,
 
     // ======================================= PUBLISHERS  ======================================= //
 
@@ -40,59 +46,83 @@ pub struct OffboardControlNode {
 
     // ======================================= STATE  ======================================= //
 
-    vehicle_trajectory_setpoint: Arc<Mutex<Option<TrajectorySetpoint>>>,
+    vehicle_local_position: Arc<Mutex<Option<[f32; 3]>>>,
+    vehicle_land_detected: Arc<Mutex<Option<bool>>>,
+    vehicle_trajectory_setpoint: Arc<Mutex<Option<[f32; 3]>>>,
     service_done: Arc<Mutex<Option<bool>>>,
+    service_result: Arc<Mutex<Option<u8>>>,
+    state: Arc<Mutex<Option<State>>>
 }
 
 impl OffboardControlNode {
     fn new(executor: &Executor) -> Result<Self, RclrsError> {
         let node = executor.create_node("offboard_control").unwrap();
 
+        // ======================================= CLIENT  ======================================= //
+
         let vehicle_command_client = node.create_client::<VehicleCommandSrv>("/fmu/vehicle_command").unwrap();
+
+        log!(node.logger().once(), "Starting Offboard Control Mission with PX4 services");
+        log!(node.logger().once(), "Waiting for /fmu/vehicle_command service");
 
         while !vehicle_command_client.service_is_ready()? {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let vehicle_local_position_worker = node.create_worker(None);
-        let vehicle_local_position_subscriber = vehicle_local_position_worker
-            .create_subscription::<VehicleLocalPosition, _>(
-                "/fmu/out/vehicle_local_position_v1"
-                .keep_last(1).best_effort().transient_local(),
-                move |data: &mut Option<VehicleLocalPosition>, msg: VehicleLocalPosition| {
-                    *data = Some(msg);
-                },
-            )
-            .unwrap();
+        // ======================================= SUBSCRIBERS  ======================================= //
 
-        let vehicle_land_detected_worker = node.create_worker(None);
-        let vehicle_land_detected_subscriber = vehicle_land_detected_worker
-            .create_subscription::<VehicleLandDetected, _>(
-                "/fmu/out/vehicle_land_detected"
-                .keep_last(1).best_effort().transient_local(),
-                move |data: &mut Option<bool>, msg: VehicleLandDetected| {
-                    *data = Some(msg.landed);
-                },
-            )
-            .unwrap();
+        // we need 2 shared pointers for each of the data points we are subscribed to
+        // 1 for instantiation through Ok(Self{}) at the end, 1 for the subscription callback
+        let vehicle_local_position = Arc::new(Mutex::new(Some([0.0, 0.0, 0.0])));
+        let vehicle_local_position_callback = Arc::clone(&vehicle_local_position);
+
+        let vehicle_land_detected = Arc::new(Mutex::new(Some(true)));
+        let vehicle_land_detected_callback = Arc::clone(&vehicle_land_detected);
+
+        let vehicle_local_position_subscriber = node.create_subscription(
+            "/fmu/out/vehicle_local_position_v1"
+            .keep_last(1).best_effort().transient_local(),
+            move |msg: VehicleLocalPosition| {
+                *vehicle_local_position_callback.lock().unwrap() = Some([msg.x, msg.y, msg.z]);
+            },
+        )
+        .unwrap();
+
+        let vehicle_land_detected_subscriber = node.create_subscription(
+            "/fmu/out/vehicle_land_detected"
+            .keep_last(1).best_effort().transient_local(),
+            move |msg: VehicleLandDetected| {
+                *vehicle_land_detected_callback.lock().unwrap() = Some(msg.landed);
+            },
+        )
+        .unwrap();
+
+        // ======================================= PUBLISHERS  ======================================= //
 
         let offboard_control_mode_publisher = node.create_publisher::<OffboardControlMode>("/fmu/in/offboard_control_mode")?;
         let trajectory_setpoint_publisher = node.create_publisher::<TrajectorySetpoint>("/fmu/in/trajectory_setpoint")?;
 
-        let vehicle_trajectory_setpoint = Arc::new(Mutex::new(None));
-        let service_done = Arc::new(Mutex::new(None));
+        // ======================================= STATE  ======================================= //
+
+        let now = node.get_clock().now().nsec / 1000;
+        let vehicle_trajectory_setpoint = Arc::new(Mutex::new(Some([0.0, 0.0, -5.0])));
+        let service_done = Arc::new(Mutex::new(Some(false)));
+        let service_result = Arc::new(Mutex::new(Some(VehicleCommandAck::VEHICLE_CMD_RESULT_ACCEPTED)));
+        let state = Arc::new(Mutex::new(Some(State::Init)));
 
         Ok(Self { 
             node,
             vehicle_command_client,
             vehicle_local_position_subscriber, 
-            vehicle_local_position_worker, 
             vehicle_land_detected_subscriber,
-            vehicle_land_detected_worker,
             offboard_control_mode_publisher,
             trajectory_setpoint_publisher,
+            vehicle_local_position,
+            vehicle_land_detected,
             vehicle_trajectory_setpoint,
             service_done,
+            service_result,
+            state
         })
     }
 
@@ -116,7 +146,10 @@ impl OffboardControlNode {
         };
 
         let service_done = Arc::clone(&self.service_done);
+        let service_result = Arc::clone(&self.service_result);
         let logger = self.node.name().to_string();
+
+        log!(self.node.logger().once(), "Command sent");
 
         self.vehicle_command_client
         .call_then(&request, move |response: VehicleCommand_Response| {
@@ -131,6 +164,7 @@ impl OffboardControlNode {
                 _ => log_warn!(&logger, "command reply unknown"),
             };
             *service_done.lock().unwrap() = Some(true);
+            *service_result.lock().unwrap() = Some(response.reply.result);
         })
         .unwrap();
 
@@ -158,40 +192,56 @@ impl OffboardControlNode {
 
     fn publish_trajectory_setpoint(&self) -> Result<(), rclrs::RclrsError> {
 
-        if let Some(msg) = &*self.vehicle_trajectory_setpoint.lock().unwrap() {
-            self.trajectory_setpoint_publisher.publish(msg);
-        }
+        let now = self.node.get_clock().now().nsec / 1000;
+
+        let Some(position) = &*self.vehicle_trajectory_setpoint.lock().unwrap() else { panic!("Invalid Node State Variable") };
+
+        let msg = TrajectorySetpoint {
+            timestamp: now as u64,
+            position: *position,
+            ..Default::default()
+        };
+
+        self.trajectory_setpoint_publisher.publish(msg);
         Ok(())
     }
 
     fn switch_to_offboard_mode(&self) -> Result<(), rclrs::RclrsError> {
 
+        log!(self.node.logger().once(), "requesting switch to Offboard mode");
         self.request_vehicle_command(VehicleCommandMsg::VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0);
         Ok(())
     }
 
     fn arm(&self) -> Result<(), rclrs::RclrsError> {
 
+        log!(self.node.logger().once(), "requesting arm");
         self.request_vehicle_command(VehicleCommandMsg::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0, 0.0);
         Ok(())
     }
 
     fn disarm(&self) -> Result<(), rclrs::RclrsError> {
 
+        log!(self.node.logger().once(), "requesting disarm");
         self.request_vehicle_command(VehicleCommandMsg::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0, 0.0);
         Ok(())
     }
 
     fn land(&self) -> Result<(), rclrs::RclrsError> {
 
+        log!(self.node.logger().once(), "requesting land");
         self.request_vehicle_command(VehicleCommandMsg::VEHICLE_CMD_NAV_LAND, 0.0, 0.0);
         Ok(())
     }
 
-    fn dist(&self, p1: [f32; 3], p2: [f32; 3]) -> f32 {
-        let dx = p2[0] - p1[0];
-        let dy = p2[1] - p1[1];
-        (dx*dx + dy*dy).sqrt()
+    fn close_to_target(&self) -> bool {
+
+        let Some(current_position) = &*self.vehicle_local_position.lock().unwrap() else { panic!("Invalid Node State Variable") };
+        let Some(goal_position) = &*self.vehicle_trajectory_setpoint.lock().unwrap() else { panic!("Invalid Node State Variable") };
+
+        let dx = goal_position[0] - current_position[0];
+        let dy = goal_position[1] - current_position[1];
+        (dx*dx + dy*dy).sqrt() < 0.035
     }
 }
 
@@ -199,54 +249,141 @@ fn main() -> Result<(), RclrsError> {
     let mut executor = Context::default_from_env().unwrap().create_basic_executor();
     let node = OffboardControlNode::new(&executor).unwrap();
 
+    let mut num_steps: u8 = 0;
+
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(100));
 
         let now = node.node.get_clock().now().nsec / 1000;
 
-        // test node state updates 
+        // get mutex guard of state variable -> read & write 
+        let mut state_guard = node.state.lock().unwrap();
+        let state = state_guard.take().expect("Invalid Node State");
 
-        let msg = TrajectorySetpoint {
-            timestamp: now as u64,
-            position: [0.0, 0.0, -5.0],
-            ..Default::default()
+        if state != State::Land {
+            // offboard_control_mode needs to be paired with trajectory_setpoint
+            node.publish_offboard_control_mode();
+            node.publish_trajectory_setpoint();
+        }
+
+        // get read lock for needed state variables
+        let Some(service_done) = &*node.service_done.lock().unwrap() else { panic!("Invalid Node State Variable") };
+        let Some(service_result) = &*node.service_result.lock().unwrap() else { panic!("Invalid Node State Variable") };
+
+        match state {
+            State::Init => {
+                node.switch_to_offboard_mode();
+                *state_guard = Some(State::OffboardRequested);
+            },
+            State::OffboardRequested => {
+                if *service_done {
+                    if *service_result == 0 {
+                        log!(node.node.logger().once(), "Entered offboard mode");
+                        *state_guard = Some(State::WaitForStableOffboardMode);				
+                    }
+                    else {
+                        log_warn!(node.node.logger().once(), "Failed to enter offboard mode, exiting");
+                        std::process::exit(0);
+                    }
+                } 
+                else {
+                    *state_guard = Some(State::OffboardRequested);
+                }
+            },
+            State::WaitForStableOffboardMode => {
+                num_steps += 1;
+                if num_steps > 10 {
+                    node.arm();
+                    *state_guard = Some(State::ArmRequested);
+                }
+                else {
+                    *state_guard = Some(State::WaitForStableOffboardMode);
+                }
+            },
+            State::ArmRequested => {
+                if *service_done {
+                    if *service_result == 0 {
+                        log!(node.node.logger().once(), "vehicle is armed, taking off");
+                        *state_guard = Some(State::Ascend);
+                    }
+                    else{
+                        log_warn!(node.node.logger().once(), "Failed to arm, exiting");
+                        std::process::exit(0);
+                    }
+                }
+                else {
+                    *state_guard = Some(State::ArmRequested);
+                }
+            },
+            State::Ascend => {
+                let Some(vehicle_local_position) = &*node.vehicle_local_position.lock().unwrap() else { panic!("Invalid Node State Variable") };
+                if vehicle_local_position[2] < -5.0 {
+                    *node.vehicle_trajectory_setpoint.lock().unwrap() = Some([10.0, 0.0, -5.0]);
+                    log!(node.node.logger().once(), "Reached altitude");
+                    *state_guard = Some(State::Point1);
+                }
+                else {
+                    *state_guard = Some(State::Ascend);
+                }
+            },
+            State::Point1 => {
+                if node.close_to_target() {
+                    *node.vehicle_trajectory_setpoint.lock().unwrap() = Some([10.0, 10.0, -5.0]);                    
+                    log!(node.node.logger().once(), "Reached point 1");
+                    *state_guard = Some(State::Point2);  
+                }
+                else {
+                    *state_guard = Some(State::Point1);
+                }
+            },
+            State::Point2 => {
+                if node.close_to_target() {
+                    *node.vehicle_trajectory_setpoint.lock().unwrap() = Some([0.0, 10.0, -5.0]);                    
+                    log!(node.node.logger().once(), "Reached point 2");
+                    *state_guard = Some(State::Point3);  
+                }
+                else {
+                    *state_guard = Some(State::Point2);
+                }
+            },
+            State::Point3 => {
+                if node.close_to_target() {
+                    *node.vehicle_trajectory_setpoint.lock().unwrap() = Some([0.0, 0.0, -5.0]);                    
+                    log!(node.node.logger().once(), "Reached point 3");
+                    *state_guard = Some(State::Point4);  
+                }
+                else {
+                    *state_guard = Some(State::Point3);
+                }
+            },
+            State::Point4 => {
+                if node.close_to_target() {
+                    log!(node.node.logger().once(), "Reached point 4");
+                    node.land();                
+                    *state_guard = Some(State::Land);  
+                }
+                else {
+                    *state_guard = Some(State::Point4);
+                }
+            },
+            State::Land => {
+                let Some(vehicle_land_detected) = &*node.vehicle_land_detected.lock().unwrap() else { panic!("Invalid Node State Variable") };
+                if *service_done {
+                    if *service_result == 0 {
+                        if *vehicle_land_detected {
+                            log!(node.node.logger().once(), "vehicle has landed");
+                            std::process::exit(0);
+                        }
+                    }
+                    else {
+                        log_warn!(node.node.logger().once(), "Failed to land, exiting");
+                        std::process::exit(0);
+                    }
+                }
+                *state_guard = Some(State::Land);
+            },
+            _ => println!("Unknown state"),
         };
-        *node.vehicle_trajectory_setpoint.lock().unwrap() = Some(msg);
-
-        if let Some(s) = &*node.vehicle_trajectory_setpoint.lock().unwrap() {
-            println!("{s:?}");
-        }
-
-        if let Some(s) = &*node.service_done.lock().unwrap() {
-            println!("{s:?}");
-        }
-
-        // test vehicle_local_position subscriber 
-
-        let _ = node.vehicle_local_position_worker.run(|data: &mut Option<VehicleLocalPosition>| {
-            if let Some(data) = data {
-                println!("{data:?}");
-            } else {
-                println!("No message available yet.");
-            }
-        });
-
-        // test vehicle_land_detected subscriber 
-
-        let _ = node.vehicle_land_detected_worker.run(|data: &mut Option<bool>| {
-            if let Some(data) = data {
-                println!("{data:?}");
-            } else {
-                println!("No message available yet.");
-            }
-        });
-
-        // test publishers (ros2 topic echo ... to check in another terminal)
-
-        node.publish_offboard_control_mode();
-        node.publish_trajectory_setpoint();
-
-        node.switch_to_offboard_mode();
     });
 
     executor.spin(SpinOptions::default()).first_error()
