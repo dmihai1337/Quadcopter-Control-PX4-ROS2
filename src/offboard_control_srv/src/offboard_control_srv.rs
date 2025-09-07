@@ -22,9 +22,18 @@ enum State {
     WaitForStableOffboardMode,
     ArmRequested,
     Ascend,
-    Point1, Point2, Point3, Point4,
+    Circuit,
     Land
 }
+
+#[derive(Debug, PartialEq)]
+enum Progress {
+    EnRoute,
+    ArrivedAndNext,
+    ArrivedAndFinish
+}
+
+const MEMORY_ERROR_MESSAGE: &str = "Memory Management Error, check node code!";
 
 pub struct OffboardControlNode {
 
@@ -48,7 +57,8 @@ pub struct OffboardControlNode {
 
     vehicle_local_position: Arc<Mutex<Option<[f32; 3]>>>,
     vehicle_land_detected: Arc<Mutex<Option<bool>>>,
-    vehicle_trajectory_setpoint: Arc<Mutex<Option<[f32; 3]>>>,
+    circuit: Arc<Mutex<Option<Vec<[f32; 3]>>>>,
+    circuit_iterator: Arc<Mutex<Option<usize>>>,
     service_done: Arc<Mutex<Option<bool>>>,
     service_result: Arc<Mutex<Option<u8>>>,
     state: Arc<Mutex<Option<State>>>
@@ -104,8 +114,8 @@ impl OffboardControlNode {
 
         // ======================================= STATE  ======================================= //
 
-        let now = node.get_clock().now().nsec / 1000;
-        let vehicle_trajectory_setpoint = Arc::new(Mutex::new(Some([0.0, 0.0, -5.0])));
+        let circuit = Arc::new(Mutex::new(Some(Vec::new())));
+        let circuit_iterator = Arc::new(Mutex::new(Some(0)));
         let service_done = Arc::new(Mutex::new(Some(false)));
         let service_result = Arc::new(Mutex::new(Some(VehicleCommandAck::VEHICLE_CMD_RESULT_ACCEPTED)));
         let state = Arc::new(Mutex::new(Some(State::Init)));
@@ -119,7 +129,8 @@ impl OffboardControlNode {
             trajectory_setpoint_publisher,
             vehicle_local_position,
             vehicle_land_detected,
-            vehicle_trajectory_setpoint,
+            circuit,
+            circuit_iterator,
             service_done,
             service_result,
             state
@@ -194,11 +205,12 @@ impl OffboardControlNode {
 
         let now = self.node.get_clock().now().nsec / 1000;
 
-        let Some(position) = &*self.vehicle_trajectory_setpoint.lock().unwrap() else { panic!("Invalid Node State Variable") };
+        let Some(circuit) = &*self.circuit.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
+        let Some(circuit_iterator) = &*self.circuit_iterator.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
 
         let msg = TrajectorySetpoint {
             timestamp: now as u64,
-            position: *position,
+            position: circuit[*circuit_iterator],
             ..Default::default()
         };
 
@@ -234,14 +246,61 @@ impl OffboardControlNode {
         Ok(())
     }
 
-    fn close_to_target(&self) -> bool {
+    fn generate_circuit(&self) -> Result<(), rclrs::RclrsError> {
 
-        let Some(current_position) = &*self.vehicle_local_position.lock().unwrap() else { panic!("Invalid Node State Variable") };
-        let Some(goal_position) = &*self.vehicle_trajectory_setpoint.lock().unwrap() else { panic!("Invalid Node State Variable") };
+        let mut circuit_guard = self.circuit.lock().unwrap();
+        let circuit = circuit_guard.get_or_insert_with(Vec::new);
+
+        // takeoff
+        circuit.push([0.0, 0.0, -5.0]);
+
+        // =================  SQUARE  ================= //
+
+        // circuit.push([10.0, 0.0, -5.0]);
+        // circuit.push([10.0, 10.0, -5.0]);
+        // circuit.push([0.0, 10.0, -5.0]);
+        // circuit.push([0.0, 0.0, -5.0]);
+
+        // =================  CIRCLE  ================= //
+
+        // let center = [-10.0, 0.0, -5.0];
+        // let radius = 10.0;
+        // for theta in (0..=360).step_by(5) {
+        //     let angle: f32 = (theta as f32) / 180.0 * 3.14;
+        //     let x = center[0] + radius * angle.cos();
+        //     let y = center[1] + radius * angle.sin();
+        //     circuit.push([x, y, -5.0]);
+        // }
+
+        Ok(())
+    }
+
+    fn proceed(&self) -> Progress {
+
+        let Some(current_position) = &*self.vehicle_local_position.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
+
+        let Some(circuit) = &*self.circuit.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
+
+        let mut circuit_iterator_guard = self.circuit_iterator.lock().unwrap();
+        let circuit_iterator = circuit_iterator_guard.take().expect("{MEMORY_ERROR_MESSAGE}");
+        let goal_position = circuit[circuit_iterator];
 
         let dx = goal_position[0] - current_position[0];
         let dy = goal_position[1] - current_position[1];
-        (dx*dx + dy*dy).sqrt() < 0.035
+        let dz = goal_position[2] - current_position[2];
+
+        if (dx*dx + dy*dy + dz*dz).sqrt() < 0.5 {
+            if circuit_iterator == circuit.len() - 1 {
+                *circuit_iterator_guard = Some(circuit_iterator);
+                return Progress::ArrivedAndFinish;
+            }
+            else {
+                *circuit_iterator_guard = Some(circuit_iterator + 1);
+                return Progress::ArrivedAndNext;
+            }
+        }
+        *circuit_iterator_guard = Some(circuit_iterator);
+        return Progress::EnRoute;
     }
 }
 
@@ -250,11 +309,10 @@ fn main() -> Result<(), RclrsError> {
     let node = OffboardControlNode::new(&executor).unwrap();
 
     let mut num_steps: u8 = 0;
+    node.generate_circuit();
 
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(100));
-
-        let now = node.node.get_clock().now().nsec / 1000;
 
         // get mutex guard of state variable -> read & write 
         let mut state_guard = node.state.lock().unwrap();
@@ -267,8 +325,8 @@ fn main() -> Result<(), RclrsError> {
         }
 
         // get read lock for needed state variables
-        let Some(service_done) = &*node.service_done.lock().unwrap() else { panic!("Invalid Node State Variable") };
-        let Some(service_result) = &*node.service_result.lock().unwrap() else { panic!("Invalid Node State Variable") };
+        let Some(service_done) = &*node.service_done.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
+        let Some(service_result) = &*node.service_result.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
 
         match state {
             State::Init => {
@@ -293,6 +351,7 @@ fn main() -> Result<(), RclrsError> {
             State::WaitForStableOffboardMode => {
                 num_steps += 1;
                 if num_steps > 10 {
+                    num_steps = 0;
                     node.arm();
                     *state_guard = Some(State::ArmRequested);
                 }
@@ -316,58 +375,40 @@ fn main() -> Result<(), RclrsError> {
                 }
             },
             State::Ascend => {
-                let Some(vehicle_local_position) = &*node.vehicle_local_position.lock().unwrap() else { panic!("Invalid Node State Variable") };
-                if vehicle_local_position[2] < -5.0 {
-                    *node.vehicle_trajectory_setpoint.lock().unwrap() = Some([10.0, 0.0, -5.0]);
-                    log!(node.node.logger().once(), "Reached altitude");
-                    *state_guard = Some(State::Point1);
-                }
-                else {
-                    *state_guard = Some(State::Ascend);
-                }
-            },
-            State::Point1 => {
-                if node.close_to_target() {
-                    *node.vehicle_trajectory_setpoint.lock().unwrap() = Some([10.0, 10.0, -5.0]);                    
-                    log!(node.node.logger().once(), "Reached point 1");
-                    *state_guard = Some(State::Point2);  
-                }
-                else {
-                    *state_guard = Some(State::Point1);
+                let status: Progress = node.proceed();
+                match status {
+                    Progress::EnRoute => {
+                        *state_guard = Some(State::Ascend)
+                    },
+                    Progress::ArrivedAndFinish => {
+                        log!(node.node.logger().once(), "Reached altitude");
+                        node.land();
+                        *state_guard = Some(State::Land);
+                    },
+                    Progress::ArrivedAndNext => {
+                        log!(node.node.logger().once(), "Reached altitude");
+                        *state_guard = Some(State::Circuit);
+                    },
                 }
             },
-            State::Point2 => {
-                if node.close_to_target() {
-                    *node.vehicle_trajectory_setpoint.lock().unwrap() = Some([0.0, 10.0, -5.0]);                    
-                    log!(node.node.logger().once(), "Reached point 2");
-                    *state_guard = Some(State::Point3);  
-                }
-                else {
-                    *state_guard = Some(State::Point2);
-                }
-            },
-            State::Point3 => {
-                if node.close_to_target() {
-                    *node.vehicle_trajectory_setpoint.lock().unwrap() = Some([0.0, 0.0, -5.0]);                    
-                    log!(node.node.logger().once(), "Reached point 3");
-                    *state_guard = Some(State::Point4);  
-                }
-                else {
-                    *state_guard = Some(State::Point3);
-                }
-            },
-            State::Point4 => {
-                if node.close_to_target() {
-                    log!(node.node.logger().once(), "Reached point 4");
-                    node.land();                
-                    *state_guard = Some(State::Land);  
-                }
-                else {
-                    *state_guard = Some(State::Point4);
+            State::Circuit => {
+                let status: Progress = node.proceed();
+                match status {
+                    Progress::EnRoute => {
+                        *state_guard = Some(State::Circuit)
+                    },
+                    Progress::ArrivedAndFinish => {
+                        node.land();
+                        *state_guard = Some(State::Land);
+                    },
+                    Progress::ArrivedAndNext => {
+                        log!(node.node.logger().once(), "Completing mission");
+                        *state_guard = Some(State::Circuit);
+                    },
                 }
             },
             State::Land => {
-                let Some(vehicle_land_detected) = &*node.vehicle_land_detected.lock().unwrap() else { panic!("Invalid Node State Variable") };
+                let Some(vehicle_land_detected) = &*node.vehicle_land_detected.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
                 if *service_done {
                     if *service_result == 0 {
                         if *vehicle_land_detected {
@@ -382,7 +423,6 @@ fn main() -> Result<(), RclrsError> {
                 }
                 *state_guard = Some(State::Land);
             },
-            _ => println!("Unknown state"),
         };
     });
 
