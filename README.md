@@ -14,9 +14,11 @@ The next step is setting up `PX4 Autopilot`, which is done by cloning the repo a
 
 In order to facilitate communication between PX4 Autopilot and ROS2 we need to set up a piece of middleware called `uXRCE-DDS` as detailed in the [PX4 documentation for ROS2](https://docs.px4.io/main/en/ros2/user_guide.html#setup-micro-xrce-dds-agent-client), which allows the uORB messages of PX4 to be published and subscribed to as though they were ROS topics. An issue was encountered here while building from source, where, in the CMakeLists.txt a branch is specified that does not exist anymore. Referencing a newer, existing branch instead, fixed the problem.
 
-In every ROS2 x PX4 workspace there needs to be a copy of the package [`px4_msgs`](https://github.com/PX4/px4_msgs), which contains ROS2 message definitions for PX4. The package [`px4_ros_com`](https://github.com/PX4/px4_ros_com) contains example nodes for exchanging data and commands between ROS2 and PX4, so we'll clone it as well to get some boilerplate from it.
+In every ROS2 x PX4 workspace there needs to be a copy of the package [`px4_msgs`](https://github.com/PX4/px4_msgs), which contains ROS2 message definitions for PX4. The package [`px4_ros_com`](https://github.com/PX4/px4_ros_com) contains example nodes for exchanging data and commands between ROS2 and PX4, so we'll clone it as well to get some boilerplate from it. Since we will eventually work in Rust, we need to install [`Rust`](https://www.rust-lang.org/tools/install) and the [`rclrs`](https://github.com/ros2-rust/ros2_rust/blob/main/README.md) bindings. A new package is created with `cargo new` and we also need the cloned px4_msgs package in the same workspace since it's a dependency. 
 
 The last tool that we need for now is the Ground Control Station [`QGroundControl`](https://docs.qgroundcontrol.com/master/en/qgc-user-guide/getting_started/download_and_install.html#ubuntu), for communication with the drone.
+
+The script `setup.sh` is intended to automate the entire environment setup discussed above. It is more convenient than a Dockerfile since all that is needed is to glue all the bash setup commands from the above frameworks into a single shell script. The script was, however, not tested. It's expected not to work right away but it should only need some small tweaks. I decided to invest the majority of my time in the implementation, which is discussed below.
 
 ## Journal
 
@@ -48,3 +50,31 @@ The FSM was initially designed to complete a square. In the commit "FSM redesign
 Some last details were changed in the commit "Refinement", according to the specifics of the task description, such as arming *before* switching to offboard mode, holding for 3 seconds after takeoff, triggering landing in case of failure, and console + csv file logging. Last but not least, the commit "Heading control" also implements `heading` control for the drone to be aligned with its course, allowing for a Figure 8 maneuver as seen in the demo video.
 
 The project could be extended by letting the user draw the mission circuit freely by hand, then convert those lines to a waypoint list. Another idea would be introducing more complex circuits, where the drone uses perception to scan for obstacles and plan its course on the spot. It has been a pleasure to work on this project and to learn by doing, so I wish to thank you for the opportunity and hope to hear from the team soon.
+
+## Usage
+
+In different terminals:
+
+```bash
+./qgc/QGroundControl-x86_64.AppImage
+```
+
+```bash
+python PX4-gazebo-models/simulation-gazebo --world=baylands
+```
+
+```bash
+MicroXRCEAgent udp4 -p 8888
+```
+
+```bash
+PX4_GZ_STANDALONE=1 PX4_GZ_WORLD=baylands make px4_sitl gz_x500
+```
+
+```bash
+cd ws_ros_px4
+colcon build
+source install/setup.bash
+ros2 run offboard_control_srv offboard_control_srv
+```
+
