@@ -205,9 +205,24 @@ impl OffboardControlNode {
         let Some(circuit) = &*self.circuit.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
         let Some(circuit_iterator) = &*self.circuit_iterator.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
 
+        let Some(current_status) = &*self.vehicle_local_position.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
+        let current_position = [current_status.x, current_status.y, current_status.z];
+        let goal_position = circuit[*circuit_iterator];
+
+        // only set heading when running mission
+
+        let heading = 
+        if *circuit_iterator != 0 {
+            f32::atan2(goal_position[1] - current_position[1], goal_position[0] - current_position[0])
+        }
+        else {
+            0.0
+        };
+
         let msg = TrajectorySetpoint {
             timestamp: now as u64,
-            position: circuit[*circuit_iterator],
+            position: goal_position,
+            yaw: heading,
             ..Default::default()
         };
 
@@ -249,27 +264,28 @@ impl OffboardControlNode {
 
         // define circuit (can also be left blank => only takeoff & land)
 
-        // =================  SQUARE  ================= //
+        // =================  FIGURE 8  ================= //
 
-        // circuit.push([10.0, 0.0, -5.0]);
-        // circuit.push([10.0, 10.0, -5.0]);
-        // circuit.push([0.0, 10.0, -5.0]);
-        // circuit.push([0.0, 0.0, -5.0]);
+        // 2 circles
+        let radius = 2.5;
 
-        // ============================================ //
+        let center1 = [-radius, 0.0, -5.0];
+        for theta in (0..=360) {
+            let angle: f32 = (theta as f32) / 180.0 * 3.14;
+            let x = center1[0] + radius * angle.cos();
+            let y = center1[1] + radius * angle.sin();
+            circuit.push([x, y, -5.0]);
+        }
 
-        // =================  CIRCLE  ================= //
-
-        // let center = [-10.0, 0.0, -5.0];
-        // let radius = 10.0;
-        // for theta in (0..=360).step_by(5) {
-        //     let angle: f32 = (theta as f32) / 180.0 * 3.14;
-        //     let x = center[0] + radius * angle.cos();
-        //     let y = center[1] + radius * angle.sin();
-        //     circuit.push([x, y, -5.0]);
-        // }
-
-        // ============================================ //
+        let center2 = [radius, 0.0, -5.0];
+        for theta in (0..=360).rev() {
+            let angle: f32 = (theta as f32) / 180.0 * 3.14;
+            let x = center2[0] - radius * angle.cos();
+            let y = center2[1] - radius * angle.sin();
+            circuit.push([x, y, -5.0]);
+        }
+        
+        // ============================================== //
 
         Ok(())
     }
@@ -290,7 +306,7 @@ impl OffboardControlNode {
         let dy = goal_position[1] - current_position[1];
         let dz = goal_position[2] - current_position[2];
 
-        if (dx*dx + dy*dy + dz*dz).sqrt() < 0.5 {
+        if (dx*dx + dy*dy + dz*dz).sqrt() < 0.25 {
             if circuit_iterator == circuit.len() - 1 {
                 *circuit_iterator_guard = Some(circuit_iterator);
                 return Progress::ArrivedAndFinish;
