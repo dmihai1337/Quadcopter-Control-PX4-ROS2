@@ -1,6 +1,9 @@
 use rclrs::*;
 use std::{thread, time::Duration};
 use std::sync::{Arc, Mutex};
+use std::fs::File;
+use csv::Writer;
+
 use px4_msgs::msg::{
     VehicleCommand as VehicleCommandMsg, 
     VehicleCommandAck, 
@@ -18,11 +21,13 @@ use px4_msgs::srv::{
 #[derive(Debug, PartialEq)]
 enum State {
     Init,
+    ArmRequested,
     OffboardRequested,
     WaitForStableOffboardMode,
-    ArmRequested,
     Ascend,
+    Hold,
     Circuit,
+    Failure,
     Land
 }
 
@@ -34,6 +39,7 @@ enum Progress {
 }
 
 const MEMORY_ERROR_MESSAGE: &str = "Memory Management Error, check node code!";
+const CSV_ERROR_MESSAGE: &str = "Error with CSV logging, check node code!";
 
 pub struct OffboardControlNode {
 
@@ -55,13 +61,14 @@ pub struct OffboardControlNode {
 
     // ======================================= STATE  ======================================= //
 
-    vehicle_local_position: Arc<Mutex<Option<[f32; 3]>>>,
+    vehicle_local_position: Arc<Mutex<Option<VehicleLocalPosition>>>,
     vehicle_land_detected: Arc<Mutex<Option<bool>>>,
     circuit: Arc<Mutex<Option<Vec<[f32; 3]>>>>,
     circuit_iterator: Arc<Mutex<Option<usize>>>,
     service_done: Arc<Mutex<Option<bool>>>,
     service_result: Arc<Mutex<Option<u8>>>,
-    state: Arc<Mutex<Option<State>>>
+    state: Arc<Mutex<Option<State>>>,
+    csv_writer: Arc<Mutex<Option<Writer<File>>>>
 }
 
 impl OffboardControlNode {
@@ -72,9 +79,6 @@ impl OffboardControlNode {
 
         let vehicle_command_client = node.create_client::<VehicleCommandSrv>("/fmu/vehicle_command").unwrap();
 
-        log!(node.logger().once(), "Starting Offboard Control Mission with PX4 services");
-        log!(node.logger().once(), "Waiting for /fmu/vehicle_command service");
-
         while !vehicle_command_client.service_is_ready()? {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -83,7 +87,7 @@ impl OffboardControlNode {
 
         // we need 2 shared pointers for each of the data points we are subscribed to
         // 1 for instantiation through Ok(Self{}) at the end, 1 for the subscription callback
-        let vehicle_local_position = Arc::new(Mutex::new(Some([0.0, 0.0, 0.0])));
+        let vehicle_local_position = Arc::new(Mutex::new(None));
         let vehicle_local_position_callback = Arc::clone(&vehicle_local_position);
 
         let vehicle_land_detected = Arc::new(Mutex::new(Some(true)));
@@ -93,7 +97,7 @@ impl OffboardControlNode {
             "/fmu/out/vehicle_local_position_v1"
             .keep_last(1).best_effort().transient_local(),
             move |msg: VehicleLocalPosition| {
-                *vehicle_local_position_callback.lock().unwrap() = Some([msg.x, msg.y, msg.z]);
+                *vehicle_local_position_callback.lock().unwrap() = Some(msg);
             },
         )
         .unwrap();
@@ -119,6 +123,9 @@ impl OffboardControlNode {
         let service_done = Arc::new(Mutex::new(Some(false)));
         let service_result = Arc::new(Mutex::new(Some(VehicleCommandAck::VEHICLE_CMD_RESULT_ACCEPTED)));
         let state = Arc::new(Mutex::new(Some(State::Init)));
+        let mut writer = Writer::from_path("mission_log.csv").expect("{CSV_ERROR_MESSAGE}");
+        writer.write_record(&["Timestamp", "x", "y", "z", "heading", "Flight Mode", "Mission Phase"]).expect("{CSV_ERROR_MESSAGE}");
+        let csv_writer = Arc::new(Mutex::new(Some(writer)));
 
         Ok(Self { 
             node,
@@ -133,7 +140,8 @@ impl OffboardControlNode {
             circuit_iterator,
             service_done,
             service_result,
-            state
+            state,
+            csv_writer
         })
     }
 
@@ -160,20 +168,9 @@ impl OffboardControlNode {
         let service_result = Arc::clone(&self.service_result);
         let logger = self.node.name().to_string();
 
-        log!(self.node.logger().once(), "Command sent");
 
         self.vehicle_command_client
         .call_then(&request, move |response: VehicleCommand_Response| {
-            match response.reply.result {
-                VehicleCommandAck::VEHICLE_CMD_RESULT_ACCEPTED => log!(&logger, "command accepted"),
-                VehicleCommandAck::VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED => log_warn!(&logger, "command temporarily rejected"),
-                VehicleCommandAck::VEHICLE_CMD_RESULT_DENIED => log_warn!(&logger, "command denied"),
-                VehicleCommandAck::VEHICLE_CMD_RESULT_UNSUPPORTED => log_warn!(&logger, "command unsupported"),
-                VehicleCommandAck::VEHICLE_CMD_RESULT_FAILED => log_warn!(&logger, "command failed"),
-                VehicleCommandAck::VEHICLE_CMD_RESULT_IN_PROGRESS => log_warn!(&logger, "command in progress"),
-                VehicleCommandAck::VEHICLE_CMD_RESULT_CANCELLED => log_warn!(&logger, "command cancelled"),
-                _ => log_warn!(&logger, "command reply unknown"),
-            };
             *service_done.lock().unwrap() = Some(true);
             *service_result.lock().unwrap() = Some(response.reply.result);
         })
@@ -220,28 +217,24 @@ impl OffboardControlNode {
 
     fn switch_to_offboard_mode(&self) -> Result<(), rclrs::RclrsError> {
 
-        log!(self.node.logger().once(), "requesting switch to Offboard mode");
         self.request_vehicle_command(VehicleCommandMsg::VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0);
         Ok(())
     }
 
     fn arm(&self) -> Result<(), rclrs::RclrsError> {
 
-        log!(self.node.logger().once(), "requesting arm");
         self.request_vehicle_command(VehicleCommandMsg::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0, 0.0);
         Ok(())
     }
 
     fn disarm(&self) -> Result<(), rclrs::RclrsError> {
 
-        log!(self.node.logger().once(), "requesting disarm");
         self.request_vehicle_command(VehicleCommandMsg::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0, 0.0);
         Ok(())
     }
 
     fn land(&self) -> Result<(), rclrs::RclrsError> {
 
-        log!(self.node.logger().once(), "requesting land");
         self.request_vehicle_command(VehicleCommandMsg::VEHICLE_CMD_NAV_LAND, 0.0, 0.0);
         Ok(())
     }
@@ -254,12 +247,16 @@ impl OffboardControlNode {
         // takeoff
         circuit.push([0.0, 0.0, -5.0]);
 
+        // define circuit (can also be left blank => only takeoff & land)
+
         // =================  SQUARE  ================= //
 
         // circuit.push([10.0, 0.0, -5.0]);
         // circuit.push([10.0, 10.0, -5.0]);
         // circuit.push([0.0, 10.0, -5.0]);
         // circuit.push([0.0, 0.0, -5.0]);
+
+        // ============================================ //
 
         // =================  CIRCLE  ================= //
 
@@ -272,17 +269,21 @@ impl OffboardControlNode {
         //     circuit.push([x, y, -5.0]);
         // }
 
+        // ============================================ //
+
         Ok(())
     }
 
     fn proceed(&self) -> Progress {
 
-        let Some(current_position) = &*self.vehicle_local_position.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
+        let Some(current_status) = &*self.vehicle_local_position.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
 
         let Some(circuit) = &*self.circuit.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
 
         let mut circuit_iterator_guard = self.circuit_iterator.lock().unwrap();
         let circuit_iterator = circuit_iterator_guard.take().expect("{MEMORY_ERROR_MESSAGE}");
+
+        let current_position = [current_status.x, current_status.y, current_status.z];
         let goal_position = circuit[circuit_iterator];
 
         let dx = goal_position[0] - current_position[0];
@@ -302,6 +303,37 @@ impl OffboardControlNode {
         *circuit_iterator_guard = Some(circuit_iterator);
         return Progress::EnRoute;
     }
+
+    fn log(&self, x: f32, y: f32, z: f32, heading: f32, mode: &str, phase: &State) -> Result<(), Box<dyn std::error::Error>> {
+
+        let now = self.node.get_clock().now().nsec / 1000;
+
+        let mut csv_writer_guard = self.csv_writer.lock().unwrap();
+        let csv_writer = csv_writer_guard.as_mut().expect("{CSV_ERROR_MESSAGE}");
+
+        // log to console
+
+        log!(
+            self.node.logger(), "[Pose]: x:{:.2} y:{:.2} z:{:.2} heading:{:.2}, [Flight Mode]: {}, [Mission Phase]: {:?}",
+            x, y, z, heading,
+            mode,
+            phase
+        );
+
+        // log to csv
+
+        csv_writer.write_record(&[
+            format!("{}", now),
+            format!("{:.2}", x),
+            format!("{:.2}", y),
+            format!("{:.2}", z),
+            format!("{:.2}", heading),
+            mode.to_string(),
+            format!("{:?}", phase),
+        ])?;
+
+        Ok(())
+    }
 }
 
 fn main() -> Result<(), RclrsError> {
@@ -316,7 +348,7 @@ fn main() -> Result<(), RclrsError> {
 
         // get mutex guard of state variable -> read & write 
         let mut state_guard = node.state.lock().unwrap();
-        let state = state_guard.take().expect("Invalid Node State");
+        let state = state_guard.take().expect("{MEMORY_ERROR_MESSAGE}");
 
         if state != State::Land {
             // offboard_control_mode needs to be paired with trajectory_setpoint
@@ -328,20 +360,48 @@ fn main() -> Result<(), RclrsError> {
         let Some(service_done) = &*node.service_done.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
         let Some(service_result) = &*node.service_result.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
 
+        // flight mode for logging
+        let mode = if state == State::Land {"Land"} else {"Offboard"};
+
+        let mut current_position_guard = node.vehicle_local_position.lock().unwrap();
+        let Some(current_position) = &*current_position_guard else { panic!("{MEMORY_ERROR_MESSAGE}") };
+
+        // handle invalid position estimate failure
+        if !current_position.xy_valid || !current_position.z_valid {
+            *state_guard = Some(State::Failure);
+            continue
+        }
+
+        node.log(current_position.x, current_position.y, current_position.z, current_position.heading, &mode, &state);
+
+        std::mem::drop(current_position_guard);
+
         match state {
             State::Init => {
-                node.switch_to_offboard_mode();
-                *state_guard = Some(State::OffboardRequested);
+                node.arm();
+                *state_guard = Some(State::ArmRequested);
+            },
+            State::ArmRequested => {
+                if *service_done {
+                    if *service_result == 0 {
+                        node.switch_to_offboard_mode();
+                        *state_guard = Some(State::OffboardRequested);
+                    }
+                    else{
+                        *state_guard = Some(State::Failure);
+                    }
+                }
+                else {
+                    *state_guard = Some(State::ArmRequested);
+                }
             },
             State::OffboardRequested => {
                 if *service_done {
                     if *service_result == 0 {
-                        log!(node.node.logger().once(), "Entered offboard mode");
                         *state_guard = Some(State::WaitForStableOffboardMode);				
                     }
                     else {
-                        log_warn!(node.node.logger().once(), "Failed to enter offboard mode, exiting");
-                        std::process::exit(0);
+                        *state_guard = Some(State::Failure);
                     }
                 } 
                 else {
@@ -352,72 +412,66 @@ fn main() -> Result<(), RclrsError> {
                 num_steps += 1;
                 if num_steps > 10 {
                     num_steps = 0;
-                    node.arm();
-                    *state_guard = Some(State::ArmRequested);
+                    *state_guard = Some(State::Ascend);
                 }
                 else {
                     *state_guard = Some(State::WaitForStableOffboardMode);
                 }
             },
-            State::ArmRequested => {
-                if *service_done {
-                    if *service_result == 0 {
-                        log!(node.node.logger().once(), "vehicle is armed, taking off");
-                        *state_guard = Some(State::Ascend);
-                    }
-                    else{
-                        log_warn!(node.node.logger().once(), "Failed to arm, exiting");
-                        std::process::exit(0);
-                    }
+            State::Ascend => {
+                let Some(current_position) = &*node.vehicle_local_position.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
+                if current_position.z < -5.0 {
+                    *state_guard = Some(State::Hold);
                 }
                 else {
-                    *state_guard = Some(State::ArmRequested);
+                    *state_guard = Some(State::Ascend);
                 }
             },
-            State::Ascend => {
-                let status: Progress = node.proceed();
-                match status {
-                    Progress::EnRoute => {
-                        *state_guard = Some(State::Ascend)
-                    },
-                    Progress::ArrivedAndFinish => {
-                        log!(node.node.logger().once(), "Reached altitude");
-                        node.land();
-                        *state_guard = Some(State::Land);
-                    },
-                    Progress::ArrivedAndNext => {
-                        log!(node.node.logger().once(), "Reached altitude");
-                        *state_guard = Some(State::Circuit);
-                    },
+            State::Hold => {
+                num_steps += 1;
+
+                // hold for 3 seconds after takeoff (30 steps * 100ms = 3s)
+                if num_steps > 30 {
+                    num_steps = 0;
+                    *state_guard = Some(State::Circuit);
+                }
+                else {
+                    *state_guard = Some(State::Hold);
                 }
             },
             State::Circuit => {
                 let status: Progress = node.proceed();
                 match status {
                     Progress::EnRoute => {
-                        *state_guard = Some(State::Circuit)
+                        *state_guard = Some(State::Circuit);
                     },
                     Progress::ArrivedAndFinish => {
                         node.land();
                         *state_guard = Some(State::Land);
                     },
                     Progress::ArrivedAndNext => {
-                        log!(node.node.logger().once(), "Completing mission");
                         *state_guard = Some(State::Circuit);
                     },
                 }
             },
+            State::Failure => {
+                *state_guard = Some(State::Land);
+            },
             State::Land => {
                 let Some(vehicle_land_detected) = &*node.vehicle_land_detected.lock().unwrap() else { panic!("{MEMORY_ERROR_MESSAGE}") };
                 if *service_done {
+
+                    // force writing remaining logs in order not to lose them
+                    let mut csv_writer_guard = node.csv_writer.lock().unwrap();
+                    let csv_writer = csv_writer_guard.as_mut().expect("{CSV_ERROR_MESSAGE}");
+                    csv_writer.flush().expect("{CSV_ERROR_MESSAGE}");
+
                     if *service_result == 0 {
                         if *vehicle_land_detected {
-                            log!(node.node.logger().once(), "vehicle has landed");
                             std::process::exit(0);
                         }
                     }
                     else {
-                        log_warn!(node.node.logger().once(), "Failed to land, exiting");
                         std::process::exit(0);
                     }
                 }

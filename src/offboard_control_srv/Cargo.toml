@@ -10,3 +10,4 @@ path = "src/offboard_control_srv.rs"
 [dependencies]
 rclrs = "*"
 px4_msgs = "*"
+csv = "*"
