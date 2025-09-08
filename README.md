@@ -3,6 +3,8 @@
 ## Task Description
 The task is to implement autonomous drone control for a multicopter to perform a simple mission consisting of arming, taking off, visiting a set of waypoints in offboard mode, followed by RTL or landing, while handling basic flight states and safety conditions. This is done using ROS 2 and PX4 Autopilot with Gazebo for a SITL implementation. In the following I will go through my work and my thought process at every step.
 
+<img width="3157" height="1510" alt="Screenshot of Drone Mission" src="https://github.com/user-attachments/assets/15f998ae-2ce6-4631-87cc-c846975bc913" />
+
 ## Environment
 The first hours were spent setting up the technical environment. The starting point was an Ubuntu 22.04 installation on a Lenovo Thinkpad P1 Gen 5. 
 
