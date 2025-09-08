@@ -68,11 +68,12 @@ MicroXRCEAgent udp4 -p 8888
 ```
 
 ```bash
+cd PX4-Autopilot/
 PX4_GZ_STANDALONE=1 PX4_GZ_WORLD=baylands make px4_sitl gz_x500
 ```
 
 ```bash
-cd ws_ros_px4
+cd ws_ros_px4/
 colcon build
 source install/setup.bash
 ros2 run offboard_control_srv offboard_control_srv
